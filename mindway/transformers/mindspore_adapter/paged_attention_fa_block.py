@@ -194,6 +194,8 @@ class FlashAttention(Cell):
             drop_mask_bits = None
         if self.use_alibi_mask:
             alibi_mask = self.alibi_rescale_mul(alibi_mask, F.cast(self.alibi_rescale_factor, alibi_mask.dtype))
+        if not self.use_attention_mask:
+            attn_mask = None
         _, _, _, output = self.flash_attention(
             query,
             key,

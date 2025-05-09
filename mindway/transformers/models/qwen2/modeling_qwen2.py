@@ -25,7 +25,7 @@ from typing import List, Optional, Tuple, Union
 from transformers import Qwen2Config, logging
 
 import mindspore as ms
-from mindspore import Parameter, Tensor, mint, nn, ops
+from mindspore import Parameter, Tensor, mint, nn, ops, jit
 from mindspore.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from mindway.transformers.cache_utils import Cache, get_max_length, get_seq_length, update
@@ -219,7 +219,7 @@ class Qwen2MLP(nn.Cell):
         self.up_proj = nn.Dense(self.hidden_size, self.intermediate_size, has_bias=False)
         self.down_proj = nn.Dense(self.intermediate_size, self.hidden_size, has_bias=False)
         self.act_fn = mint.nn.SiLU()
-
+    @jit
     def construct(self, hidden_state):
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
@@ -243,7 +243,7 @@ class Qwen2Attention(nn.Cell):
     and "Generating Long Sequences with Sparse Transformers".
     """
 
-    def __init__(self, config: Qwen2Config, layer_idx: Optional[int] = None):
+    def __init__(self, config: Qwen2Config, layer_idx: Optional[int] = None, is_FA_dynamic=True):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -282,7 +282,7 @@ class Qwen2Attention(nn.Cell):
         )
 
         self.scale = self.head_dim**-0.5
-
+    @jit
     def construct(
         self,
         hidden_states: ms.Tensor,
@@ -366,9 +366,9 @@ class Qwen2PageAttention(Qwen2Attention):
     flash attention and deal with padding tokens in case the input contains any of them.
     """
 
-    def __init__(self, config: Qwen2Config, layer_idx: Optional[int] = None):
+    def __init__(self, config: Qwen2Config, layer_idx: Optional[int] = None, is_FA_dynamic=True):
         super().__init__(config, layer_idx)
-        compute_dtype = str_to_dtype(config.mindspore_dtype)
+        compute_dtype = ms.bfloat16
 
         self.infer_attention = InferAttention(
             config.num_attention_heads,
@@ -382,14 +382,14 @@ class Qwen2PageAttention(Qwen2Attention):
             next_tokens=0,
             block_size=32,
             num_blocks=1024,
-            is_dynamic=True,
+            is_dynamic=is_FA_dynamic,
             use_flash_attention=True,
             rotary_cos_format=2,
             compute_dtype=compute_dtype,
         )
 
         self.is_first_iteration = True
-
+    @jit
     def construct(
         self,
         hidden_states: ms.Tensor,
@@ -436,7 +436,7 @@ QWEN2_ATTENTION_CLASSES = {
 
 
 class Qwen2DecoderLayer(nn.Cell):
-    def __init__(self, config: Qwen2Config, layer_idx: int):
+    def __init__(self, config: Qwen2Config, layer_idx: int, is_FA_dynamic=True):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -445,7 +445,7 @@ class Qwen2DecoderLayer(nn.Cell):
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
                 "unexpected results may be encountered."
             )
-        self.self_attn = QWEN2_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+        self.self_attn = QWEN2_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx, is_FA_dynamic)
 
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -453,7 +453,7 @@ class Qwen2DecoderLayer(nn.Cell):
 
         if config._attn_implementation == "paged_attention":
             self.is_first_iteration = True
-
+    @jit
     def construct(
         self,
         hidden_states: ms.Tensor,
@@ -660,14 +660,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
         config: Qwen2Config
     """
 
-    def __init__(self, config: Qwen2Config):
+    def __init__(self, config: Qwen2Config, is_FA_dynamic=True):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
         self.layers = nn.CellList(
-            [Qwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen2DecoderLayer(config, layer_idx, is_FA_dynamic) for layer_idx in range(config.num_hidden_layers)]
         )
         self._attn_implementation = config._attn_implementation
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -684,7 +684,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
-
+    @jit
     def construct(
         self,
         input_ids: ms.Tensor = None,
@@ -837,9 +837,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
 class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, is_FA_dynamic=True):
         super().__init__(config)
-        self.model = Qwen2Model(config)
+        self.model = Qwen2Model(config, is_FA_dynamic)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Dense(config.hidden_size, config.vocab_size, has_bias=False)
 
@@ -847,7 +847,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         self.post_init()
 
         if self.config._attn_implementation == "paged_attention":
-            compute_dtype = str_to_dtype(config.mindspore_dtype)
+            compute_dtype = ms.bfloat16
 
             self.freqs_mgr = FreqsMgr(
                 head_dim=config.hidden_size // config.num_attention_heads,
@@ -923,7 +923,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             slot_mapping,
             batch_valid_length,
         )
-
+    @jit(jit_level='O1', infer_boost="on", dynamic=1)
     def construct(
         self,
         input_ids: ms.Tensor = None,
@@ -967,7 +967,10 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
         if block_tables is not None:
-            bs, seq_len = input_ids.shape
+            if input_ids is not None:
+                bs, seq_len = input_ids.shape
+            else:
+                bs, seq_len, _ = inputs_embeds.shape
             mask = None
             if self.is_first_iteration:
                 freqs_cis = self.freqs_mgr.prefill(bs, seq_len)
